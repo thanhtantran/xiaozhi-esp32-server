@@ -29,6 +29,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import lombok.AllArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import xiaozhi.common.constant.Constant;
+import xiaozhi.common.exception.ErrorCode;
 import xiaozhi.common.exception.RenException;
 import xiaozhi.common.page.PageData;
 import xiaozhi.common.redis.RedisKeys;
@@ -83,27 +84,27 @@ public class DeviceServiceImpl extends BaseServiceImpl<DeviceDao, DeviceEntity> 
     @Override
     public Boolean deviceActivation(String agentId, String activationCode) {
         if (StringUtils.isBlank(activationCode)) {
-            throw new RenException("激活码不能为空");
+            throw new RenException(ErrorCode.ACTIVATION_CODE_EMPTY);
         }
         String deviceKey = "ota:activation:code:" + activationCode;
         Object cacheDeviceId = redisUtils.get(deviceKey);
         if (cacheDeviceId == null) {
-            throw new RenException("激活码错误");
+            throw new RenException(ErrorCode.ACTIVATION_CODE_ERROR);
         }
         String deviceId = (String) cacheDeviceId;
         String safeDeviceId = deviceId.replace(":", "_").toLowerCase();
         String cacheDeviceKey = String.format("ota:activation:data:%s", safeDeviceId);
         Map<String, Object> cacheMap = (Map<String, Object>) redisUtils.get(cacheDeviceKey);
         if (cacheMap == null) {
-            throw new RenException("激活码错误");
+            throw new RenException(ErrorCode.ACTIVATION_CODE_ERROR);
         }
         String cachedCode = (String) cacheMap.get("activation_code");
         if (!activationCode.equals(cachedCode)) {
-            throw new RenException("激活码错误");
+            throw new RenException(ErrorCode.ACTIVATION_CODE_ERROR);
         }
         // 检查设备有没有被激活
         if (selectById(deviceId) != null) {
-            throw new RenException("设备已激活");
+            throw new RenException(ErrorCode.DEVICE_ALREADY_ACTIVATED);
         }
 
         String macAddress = (String) cacheMap.get("mac_address");
@@ -111,7 +112,7 @@ public class DeviceServiceImpl extends BaseServiceImpl<DeviceDao, DeviceEntity> 
         String appVersion = (String) cacheMap.get("app_version");
         UserDetail user = SecurityUser.getUser();
         if (user.getId() == null) {
-            throw new RenException("用户未登录");
+            throw new RenException(ErrorCode.USER_NOT_LOGIN);
         }
 
         Date currentTime = new Date();
@@ -133,6 +134,10 @@ public class DeviceServiceImpl extends BaseServiceImpl<DeviceDao, DeviceEntity> 
         // 清理redis缓存
         redisUtils.delete(cacheDeviceKey);
         redisUtils.delete(deviceKey);
+
+        // 添加：清除智能体设备数量缓存
+        redisUtils.delete(RedisKeys.getAgentDeviceCountById(agentId));
+
         return true;
     }
 
@@ -164,6 +169,7 @@ public class DeviceServiceImpl extends BaseServiceImpl<DeviceDao, DeviceEntity> 
         DeviceReportRespDTO.Websocket websocket = new DeviceReportRespDTO.Websocket();
         // 从系统参数获取WebSocket URL，如果未配置则使用默认值
         String wsUrl = sysParamsService.getValue(Constant.SERVER_WEBSOCKET, true);
+        websocket.setToken("");
         if (StringUtils.isBlank(wsUrl) || wsUrl.equals("null")) {
             log.error("WebSocket地址未配置，请登录智控台，在参数管理找到【server.websocket】配置");
             wsUrl = "ws://xiaozhi.server.com:8000/xiaozhi/v1/";
@@ -188,7 +194,7 @@ public class DeviceServiceImpl extends BaseServiceImpl<DeviceDao, DeviceEntity> 
             try {
                 String groupId = deviceById != null && deviceById.getBoard() != null ? deviceById.getBoard()
                         : "GID_default";
-                DeviceReportRespDTO.MQTT mqtt = buildMqttConfig(macAddress, clientId, groupId);
+                DeviceReportRespDTO.MQTT mqtt = buildMqttConfig(macAddress, groupId);
                 if (mqtt != null) {
                     mqtt.setEndpoint(mqttUdpConfig);
                     response.setMqtt(mqtt);
@@ -224,6 +230,16 @@ public class DeviceServiceImpl extends BaseServiceImpl<DeviceDao, DeviceEntity> 
 
     @Override
     public void unbindDevice(Long userId, String deviceId) {
+        // 先查询设备信息，获取agentId
+        DeviceEntity device = baseDao.selectById(deviceId);
+        if (device == null) {
+            return;
+        }
+        if (StringUtils.isNotBlank(device.getAgentId())) {
+            // 清除智能体设备数量缓存
+            redisUtils.delete(RedisKeys.getAgentDeviceCountById(device.getAgentId()));
+        }
+
         UpdateWrapper<DeviceEntity> wrapper = new UpdateWrapper<>();
         wrapper.eq("user_id", userId);
         wrapper.eq("id", deviceId);
@@ -441,7 +457,7 @@ public class DeviceServiceImpl extends BaseServiceImpl<DeviceDao, DeviceEntity> 
         wrapper.eq("mac_address", dto.getMacAddress());
         DeviceEntity exist = baseDao.selectOne(wrapper);
         if (exist != null) {
-            throw new RenException("该Mac地址已存在");
+            throw new RenException(ErrorCode.MAC_ADDRESS_ALREADY_EXISTS);
         }
         Date now = new Date();
         DeviceEntity entity = new DeviceEntity();
@@ -458,6 +474,9 @@ public class DeviceServiceImpl extends BaseServiceImpl<DeviceDao, DeviceEntity> 
         entity.setUpdater(userId);
         entity.setAutoUpdate(1);
         baseDao.insert(entity);
+
+        // 添加：清除智能体设备数量缓存
+        redisUtils.delete(RedisKeys.getAgentDeviceCountById(dto.getAgentId()));
     }
 
     /**
@@ -479,11 +498,10 @@ public class DeviceServiceImpl extends BaseServiceImpl<DeviceDao, DeviceEntity> 
      * 构建MQTT配置信息
      * 
      * @param macAddress MAC地址
-     * @param clientId   客户端ID (UUID)
      * @param groupId    分组ID
      * @return MQTT配置对象
      */
-    private DeviceReportRespDTO.MQTT buildMqttConfig(String macAddress, String clientId, String groupId)
+    private DeviceReportRespDTO.MQTT buildMqttConfig(String macAddress, String groupId)
             throws Exception {
         // 从环境变量或系统参数获取签名密钥
         String signatureKey = sysParamsService.getValue("server.mqtt_signature_key", false);
@@ -495,8 +513,7 @@ public class DeviceServiceImpl extends BaseServiceImpl<DeviceDao, DeviceEntity> 
         // 构建客户端ID格式：groupId@@@macAddress@@@uuid
         String groupIdSafeStr = groupId.replace(":", "_");
         String deviceIdSafeStr = macAddress.replace(":", "_");
-        String clientIdSafeStr = clientId.replace(":", "_");
-        String mqttClientId = String.format("%s@@@%s@@@%s", groupIdSafeStr, deviceIdSafeStr, clientIdSafeStr);
+        String mqttClientId = String.format("%s@@@%s@@@%s", groupIdSafeStr, deviceIdSafeStr, deviceIdSafeStr);
 
         // 构建用户数据（包含IP等信息）
         Map<String, String> userData = new HashMap<>();
